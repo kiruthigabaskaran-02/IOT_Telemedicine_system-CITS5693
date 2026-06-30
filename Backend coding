@@ -1,0 +1,201 @@
+"""
+=========================================================
+TELEMEDICINE IoT SYSTEM - BACKEND SERVER
+=========================================================
+Framework : Flask
+Database  : SQLite (lightweight, file-based, no setup needed)
+Purpose   :
+  1. Receive vitals data from IoT sensor nodes (ESP32) or the
+     simulator (simulator.py) via POST /api/vitals
+  2. Store readings in a database
+  3. Check readings against medical thresholds and raise alerts
+  4. Serve data to the dashboard via GET /api/vitals/<patient_id>
+     and GET /api/alerts
+=========================================================
+Run with: python backend.py
+Then open dashboard.html in a browser.
+"""
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS   # Allows the dashboard (different origin) to call this API
+import sqlite3
+from datetime import datetime
+
+app = Flask(__name__)
+CORS(app)  # Enable Cross-Origin requests so dashboard.html can fetch from this server
+
+DB_NAME = "telemedicine.db"
+
+# ---------------------------------------------------------
+# MEDICAL THRESHOLDS — used to auto-generate alerts.
+# These are simplified general-purpose ranges for demo purposes;
+# real systems would personalize thresholds per patient.
+# ---------------------------------------------------------
+THRESHOLDS = {
+    "heart_rate":  {"low": 60,  "high": 100},   # beats per minute
+    "spo2":        {"low": 95,  "high": 100},   # % oxygen saturation
+    "temperature": {"low": 36.1, "high": 37.8}, # degrees Celsius
+}
+
+
+def init_db():
+    """Create the database tables if they don't already exist."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+
+    # Table to store every vitals reading received
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS vitals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            patient_id TEXT NOT NULL,
+            heart_rate REAL,
+            spo2 REAL,
+            temperature REAL,
+            timestamp TEXT NOT NULL
+        )
+    """)
+
+    # Table to store alerts triggered when a reading is out of range
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            patient_id TEXT NOT NULL,
+            message TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            timestamp TEXT NOT NULL
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def check_thresholds(patient_id, heart_rate, spo2, temperature):
+    """
+    Compares incoming readings against THRESHOLDS.
+    Any reading outside the safe range generates an alert
+    that gets saved to the alerts table.
+    """
+    alerts = []
+    now = datetime.now().isoformat()
+
+    if heart_rate < THRESHOLDS["heart_rate"]["low"]:
+        alerts.append(("Low heart rate detected", "warning"))
+    elif heart_rate > THRESHOLDS["heart_rate"]["high"]:
+        alerts.append(("High heart rate detected", "critical"))
+
+    if spo2 < THRESHOLDS["spo2"]["low"]:
+        alerts.append(("Low SpO2 (oxygen) level detected", "critical"))
+
+    if temperature < THRESHOLDS["temperature"]["low"]:
+        alerts.append(("Low body temperature detected", "warning"))
+    elif temperature > THRESHOLDS["temperature"]["high"]:
+        alerts.append(("Fever / high temperature detected", "warning"))
+
+    if alerts:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        for message, severity in alerts:
+            cursor.execute(
+                "INSERT INTO alerts (patient_id, message, severity, timestamp) VALUES (?, ?, ?, ?)",
+                (patient_id, message, severity, now)
+            )
+        conn.commit()
+        conn.close()
+
+    return alerts
+
+
+@app.route("/api/vitals", methods=["POST"])
+def receive_vitals():
+    """
+    Endpoint that IoT devices (or the simulator) call to submit new readings.
+    Expects JSON body like:
+    {
+        "patient_id": "patient_001",
+        "heart_rate": 78,
+        "spo2": 97,
+        "temperature": 36.8
+    }
+    """
+    data = request.get_json()
+
+    # Basic validation — reject malformed requests
+    required_fields = ["patient_id", "heart_rate", "spo2", "temperature"]
+    if not data or not all(field in data for field in required_fields):
+        return jsonify({"error": "Missing required fields"}), 400
+
+    patient_id = data["patient_id"]
+    heart_rate = float(data["heart_rate"])
+    spo2 = float(data["spo2"])
+    temperature = float(data["temperature"])
+    timestamp = datetime.now().isoformat()
+
+    # Save the reading to the database
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO vitals (patient_id, heart_rate, spo2, temperature, timestamp) VALUES (?, ?, ?, ?, ?)",
+        (patient_id, heart_rate, spo2, temperature, timestamp)
+    )
+    conn.commit()
+    conn.close()
+
+    # Check if this reading should trigger any alerts
+    triggered_alerts = check_thresholds(patient_id, heart_rate, spo2, temperature)
+
+    return jsonify({
+        "status": "success",
+        "alerts_triggered": len(triggered_alerts)
+    }), 201
+
+
+@app.route("/api/vitals/<patient_id>", methods=["GET"])
+def get_vitals(patient_id):
+    """
+    Returns the most recent readings for a given patient.
+    Used by the dashboard to draw charts.
+    Query param ?limit=N controls how many recent readings to return (default 20).
+    """
+    limit = request.args.get("limit", 20, type=int)
+
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row  # Lets us access columns by name
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM vitals WHERE patient_id = ? ORDER BY id DESC LIMIT ?",
+        (patient_id, limit)
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    # Convert rows to list of dicts and reverse so oldest-first (good for charting)
+    results = [dict(row) for row in rows][::-1]
+    return jsonify(results)
+
+
+@app.route("/api/alerts", methods=["GET"])
+def get_alerts():
+    """Returns the most recent alerts across all patients."""
+    limit = request.args.get("limit", 10, type=int)
+
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM alerts ORDER BY id DESC LIMIT ?", (limit,))
+    rows = cursor.fetchall()
+    conn.close()
+
+    return jsonify([dict(row) for row in rows])
+
+
+@app.route("/", methods=["GET"])
+def index():
+    """Simple health check route to confirm the server is running."""
+    return jsonify({"status": "Telemedicine IoT backend is running"})
+
+
+if __name__ == "__main__":
+    init_db()  # Make sure tables exist before the server starts
+    # host="0.0.0.0" makes the server reachable from other devices on the network (e.g. ESP32)
+    app.run(host="0.0.0.0", port=5000, debug=True)
